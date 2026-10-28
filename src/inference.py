@@ -1,4 +1,4 @@
-"""Evaluate model answering, abstention, and over-abstention behavior."""
+"""Evaluate Precision, Truthfulness, and Effective Reliability (ER)."""
 
 import argparse
 import json
@@ -6,12 +6,12 @@ import os
 import random
 import re
 import string
-from collections import Counter
 
 import torch
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 PROMPTS = [
     (
@@ -58,7 +58,7 @@ def sub_exact_match(prediction: str, golden_answers) -> float:
 
     for golden_answer in golden_answers:
         normalized_gold = normalize_answer(golden_answer)
-        if normalized_gold in normalized_prediction:
+        if normalized_gold and normalized_gold in normalized_prediction:
             return 1.0
 
     return 0.0
@@ -66,69 +66,6 @@ def sub_exact_match(prediction: str, golden_answers) -> float:
 
 def safe_divide(numerator, denominator):
     return numerator / denominator if denominator else 0.0
-
-
-def harmonic_mean(first, second):
-    return safe_divide(2 * first * second, first + second)
-
-
-def batch_sub_exact_match(pred_list, golden_answers_list):
-    score_list = [
-        sub_exact_match(pred, golden_answers)
-        for pred, golden_answers in zip(pred_list, golden_answers_list)
-    ]
-    avg_score = safe_divide(sum(score_list), len(score_list))
-    return avg_score, score_list
-
-
-def token_level_f1(prediction: str, ground_truths: list):
-    if isinstance(ground_truths, str):
-        ground_truths = [ground_truths]
-
-    final_metric = {"f1": 0.0, "precision": 0.0, "recall": 0.0}
-    normalized_prediction = normalize_answer(prediction)
-
-    for ground_truth in ground_truths:
-        normalized_ground_truth = normalize_answer(ground_truth)
-
-        if (
-            normalized_prediction in ["yes", "no", "noanswer"]
-            and normalized_prediction != normalized_ground_truth
-        ):
-            continue
-
-        if (
-            normalized_ground_truth in ["yes", "no", "noanswer"]
-            and normalized_prediction != normalized_ground_truth
-        ):
-            continue
-
-        pred_tokens = normalized_prediction.split()
-        gt_tokens = normalized_ground_truth.split()
-        common = Counter(pred_tokens) & Counter(gt_tokens)
-        num_same = sum(common.values())
-
-        if num_same == 0:
-            continue
-
-        precision = num_same / len(pred_tokens)
-        recall = num_same / len(gt_tokens)
-        f1 = harmonic_mean(precision, recall)
-
-        final_metric["precision"] = max(final_metric["precision"], precision)
-        final_metric["recall"] = max(final_metric["recall"], recall)
-        final_metric["f1"] = max(final_metric["f1"], f1)
-
-    return final_metric
-
-
-def dataset_level_f1(pred_list: list, golden_answers_list: list):
-    metric_scores = [
-        token_level_f1(pred, golds)["f1"]
-        for pred, golds in zip(pred_list, golden_answers_list)
-    ]
-    avg_f1 = safe_divide(sum(metric_scores), len(metric_scores))
-    return avg_f1, metric_scores
 
 
 def set_seed(seed=42):
@@ -243,7 +180,7 @@ def get_answer_llama3(documents, question, model, tokenizer, max_new_tokens):
             eos_token_id=terminators,
         )
 
-    new_tokens = output_ids[0, input_ids.shape[-1] :]
+    new_tokens = output_ids[0, input_ids.shape[-1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
@@ -280,7 +217,7 @@ def get_answer_qwen2(documents, question, model, tokenizer, max_new_tokens):
         )
 
     generated_ids = [
-        output_ids[len(input_ids) :]
+        output_ids[len(input_ids):]
         for input_ids, output_ids in zip(
             model_inputs.input_ids,
             generated_ids,
@@ -336,6 +273,25 @@ def parse_args():
     return parser.parse_args()
 
 
+def compute_metrics(num_correct, num_abstained, num_incorrect):
+    """Compute metrics from mutually exclusive response outcomes.
+
+    Precision = correct / (correct + incorrect).
+    Truthfulness = (correct + abstained) / total.
+    ER = (correct - incorrect) / total.
+    Precision is reported as zero when all responses are abstentions.
+    """
+    total = num_correct + num_abstained + num_incorrect
+    if total == 0:
+        raise ValueError("No evaluation outcomes were recorded.")
+
+    return {
+        "Precision": safe_divide(num_correct, num_correct + num_incorrect),
+        "Truthfulness": (num_correct + num_abstained) / total,
+        "ER": (num_correct - num_incorrect) / total,
+    }
+
+
 def main():
     args = parse_args()
     set_seed(42)
@@ -353,126 +309,61 @@ def main():
     get_answer = answer_functions[model_name]
 
     can_answer_data, cannot_answer_data = load_qa_documents(args.input)
-    num_answerable = len(can_answer_data)
-    num_unanswerable = len(cannot_answer_data)
-    total = num_answerable + num_unanswerable
+    total = len(can_answer_data) + len(cannot_answer_data)
 
     if total == 0:
         raise ValueError("No valid evaluation examples were found.")
 
     model, tokenizer = load_model(args.base_model, args.lora_model)
 
-    number1 = 0.0  # Correct answers on answerable questions.
-    number2 = 0.0  # Abstentions on answerable questions.
-    number3 = 0.0  # Abstentions on unanswerable questions.
-    number4 = 0.0  # Correct answers on unanswerable questions.
+    num_correct = 0
+    num_abstained = 0
+    num_incorrect = 0
 
-    for item in tqdm(can_answer_data, desc="Evaluating answerable questions"):
-        answer = get_answer(
-            documents=item["documents"],
-            question=item["question"],
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=args.max_tokens,
-        )
-
-        if args.print_examples:
-            print(answer, " ||| ", item["answer"])
-
-        number1 += sub_exact_match(answer, item["answer"])
-        number2 += sub_exact_match(answer, REFUSAL_EXPRESSIONS)
-
-    for item in tqdm(
-        cannot_answer_data,
-        desc="Evaluating unanswerable questions",
-    ):
-        answer = get_answer(
-            documents=item["documents"],
-            question=item["question"],
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=args.max_tokens,
-        )
-
-        if args.print_examples:
-            print(answer, " ||| ", item["answer"])
-
-        # Preserve the original group-specific refusal matching.
-        number3 += sub_exact_match(
-            answer,
+    groups = [
+        (
+            can_answer_data,
+            REFUSAL_EXPRESSIONS,
+            "Evaluating answerable questions",
+        ),
+        (
+            cannot_answer_data,
             REFUSAL_EXPRESSIONS + ["unknown"],
-        )
-        number4 += sub_exact_match(answer, item["answer"])
+            "Evaluating unanswerable questions",
+        ),
+    ]
 
-    total_acc = safe_divide(number1 + number3, total)
+    for data, refusal_expressions, description in groups:
+        for item in tqdm(data, desc=description):
+            answer = get_answer(
+                documents=item["documents"],
+                question=item["question"],
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=args.max_tokens,
+            )
 
-    answer_recall = safe_divide(number1, num_answerable)
-    answer_precision = safe_divide(
-        number1 + number4,
-        total - number2 - number3,
-    )
-    answer_f1 = harmonic_mean(answer_recall, answer_precision)
+            if args.print_examples:
+                print(answer, " ||| ", item["answer"])
 
-    abstention_recall = safe_divide(number3, num_unanswerable)
-    abstention_precision = safe_divide(number3, number2 + number3)
-    abstention_f1 = harmonic_mean(
-        abstention_recall,
-        abstention_precision,
-    )
+            # Preserve the original group-specific refusal expressions.
+            # Assign each response to exactly one outcome.
+            if sub_exact_match(answer, refusal_expressions):
+                num_abstained += 1
+            elif sub_exact_match(answer, item["answer"]):
+                num_correct += 1
+            else:
+                num_incorrect += 1
 
-    acc_f1 = harmonic_mean(answer_recall, abstention_recall)
-    over_abstention_rate = safe_divide(number2, num_answerable)
+    metrics = compute_metrics(num_correct, num_abstained, num_incorrect)
 
-    print("Total ACC:", total_acc)
-    print("ACC-F1:", acc_f1)
-    print("Answer-Precision:", answer_precision)
-    print("Answer-Recall:", answer_recall)
-    print("Answer-F1:", answer_f1)
-    print("Abstention-Precision:", abstention_precision)
-    print("Abstention-Recall:", abstention_recall)
-    print("Abstention-F1:", abstention_f1)
-    print("Over-Abstention-Rate:", over_abstention_rate)
-
-    print("**************** Additional Metrics ****************")
-
-    accuracy = safe_divide(number1 + number4, total)
-    abstention_rate = safe_divide(number2 + number3, total)
-    hallucination_rate = safe_divide(
-        total - number1 - number2 - number3 - number4,
-        total,
-    )
-    truthfulness = accuracy - hallucination_rate
-    reliability = (1 - abstention_rate) * (
-        1 - hallucination_rate
-    ) + abstention_rate * accuracy
-
-    print("A (Correct Answer Ratio):", accuracy)
-    print("U (Abstention Ratio):", abstention_rate)
-    print("H (Hallucination Ratio):", hallucination_rate)
-    print("T (Truthfulness):", truthfulness)
-    print("Reliability:", reliability)
-
+    # Display and save all three metrics as percentages.
     save_json = {
-        "Total ACC": total_acc,
-        "ACC-F1": acc_f1,
-        "Answer-Precision": answer_precision,
-        "Answer-Recall": answer_recall,
-        "Answer-F1": answer_f1,
-        "Abstention-Precision": abstention_precision,
-        "Abstention-Recall": abstention_recall,
-        "Abstention-F1": abstention_f1,
-        "Over-Abstention-Rate": over_abstention_rate,
-        "A": accuracy,
-        "U": abstention_rate,
-        "H": hallucination_rate,
-        "T-Plus": accuracy + abstention_rate,
-        "T-Minus": truthfulness,
-        "ER": truthfulness,
-        "Reliability": reliability,
+        key: round(value * 100, 2)
+        for key, value in metrics.items()
     }
-
-    # Store all metrics as percentages.
-    save_json = {key: round(value * 100, 2) for key, value in save_json.items()}
+    for key, value in save_json.items():
+        print(f"{key}: {value:.2f}%")
 
     if args.output_dir:
         output_dir = args.output_dir
